@@ -1,0 +1,1737 @@
+<!DOCTYPE html><html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NITRICX — Powered by Nitric Oxide. Fueled by Science.</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&amp;family=Barlow+Condensed:ital,wght@0,300;0,400;0,600;0,700;0,900;1,300;1,700;1,900&amp;family=Barlow:wght@300;400;500&amp;display=swap" rel="stylesheet">
+<style>
+
+/* ═══════ RESET & ROOT ═══════ */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior: smooth; font-size: 16px; }
+
+:root {
+  --white:   #F8F8F8;
+  --off:     #EFEFEF;
+  --black:   #080808;
+  --charcoal:#181818;
+  --yellow:  #D91A0A;
+  --yellow2: #BF1508;
+  --red:     #D91A0A;
+  --gray:    #888888;
+  --lgray:   #CCCCCC;
+
+  --f-display: 'Bebas Neue', sans-serif;
+  --f-cond:    'Barlow Condensed', sans-serif;
+  --f-body:    'Barlow', sans-serif;
+}
+
+body {
+  background: var(--white);
+  color: var(--black);
+  font-family: var(--f-body);
+  overflow-x: hidden;
+  cursor: default;
+}
+
+/* ═══════ CUSTOM CURSOR (disabled) ═══════ */
+#cursor, #cursor-ring { display: none; }
+
+/* ═══════ NAV ═══════ */
+nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 500;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 3rem;
+  height: 64px;
+  background: var(--black);
+  border-bottom: 2px solid var(--yellow);
+}
+.nav-logo {
+  font-family: var(--f-display);
+  font-size: 1.6rem; letter-spacing: 0.08em;
+  color: var(--yellow);
+  line-height: 1;
+}
+.nav-logo sup {
+  font-family: var(--f-cond); font-size: 0.5rem; font-weight: 700;
+  color: var(--white); letter-spacing: 0.3em;
+  vertical-align: super;
+}
+.nav-center {
+  display: flex; gap: 0;
+  border-left: 1px solid rgba(255,255,255,0.1);
+  border-right: 1px solid rgba(255,255,255,0.1);
+}
+.nav-center a {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 700;
+  letter-spacing: 0.25em; text-transform: uppercase; text-decoration: none;
+  color: rgba(245,242,232,0.5);
+  padding: 0 1.5rem; height: 64px; display: flex; align-items: center;
+  border-right: 1px solid rgba(255,255,255,0.06);
+  transition: color 0.2s, background 0.2s;
+}
+.nav-center a:hover { color: var(--yellow); background: rgba(212,240,60,0.05); }
+.nav-right { display: flex; gap: 1rem; align-items: center; }
+.nav-tag {
+  font-family: var(--f-cond); font-size: 0.6rem; font-weight: 700;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: rgba(245,242,232,0.3); display: none;
+}
+@media (min-width: 900px) { .nav-tag { display: block; } }
+.btn-nav {
+  font-family: var(--f-cond); font-size: 0.7rem; font-weight: 900;
+  letter-spacing: 0.2em; text-transform: uppercase; text-decoration: none;
+  background: var(--yellow); color: var(--black);
+  padding: 0.55rem 1.5rem;
+  border: none;
+  transition: background 0.2s, transform 0.1s;
+  display: inline-block;
+}.btn-nav:hover { background: var(--yellow2); transform: translateY(-1px); }
+
+/* ═══════ HERO ═══════ */
+.hero {
+  min-height: 100vh;
+  background: var(--black);
+  display: grid; grid-template-rows: 1fr auto;
+  padding-top: 64px;
+  position: relative; overflow: hidden;
+}
+
+/* Background grid lines */
+.hero::before {
+  content: '';
+  position: absolute; inset: 0;
+  background-image:
+    linear-gradient(rgba(217,26,10,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(217,26,10,0.05) 1px, transparent 1px);
+  background-size: 80px 80px;
+  pointer-events: none;
+}
+
+/* Diagonal slash accent */
+.hero-slash {
+  position: absolute;
+  top: -10%; right: -5%;
+  width: 55%; height: 130%;
+  background: var(--charcoal);
+  transform: skewX(-6deg);
+  transform-origin: top right;
+  pointer-events: none;
+}
+.hero-slash::after {
+  content: '';
+  position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--yellow);
+}
+
+.hero-inner {
+  position: relative; z-index: 2;
+  display: grid; grid-template-columns: 1fr 1fr;
+  align-items: center;
+  max-width: 1400px; margin: 0 auto; padding: 4rem 3rem;
+  width: 100%;
+  gap: 0;
+}
+
+.hero-left { padding-right: 2rem; }
+
+.hero-kicker {
+  font-family: var(--f-cond); font-size: 0.7rem; font-weight: 700;
+  letter-spacing: 0.5em; text-transform: uppercase;
+  color: var(--yellow);
+  display: flex; align-items: center; gap: 0.8rem; margin-bottom: 1.5rem;
+  opacity: 0; animation: slide-right 0.7s 0.2s ease forwards;
+}
+.hero-kicker::before {
+  content: ''; display: block; width: 30px; height: 2px;
+  background: var(--yellow);
+}
+
+.hero-h1 {
+  font-family: var(--f-display);
+  font-size: clamp(5.5rem, 11vw, 10rem);
+  line-height: 0.88; letter-spacing: 0.01em;
+  color: var(--white);
+  opacity: 0; animation: slide-right 0.7s 0.35s ease forwards;
+}
+.hero-h1 .accent { color: var(--yellow); display: block; }
+.hero-h1 .stroke {
+  -webkit-text-stroke: 2px var(--white);
+  color: transparent; display: block;
+}
+
+.hero-sub {
+  font-family: var(--f-cond); font-size: clamp(1rem, 2vw, 1.2rem);
+  font-weight: 300; letter-spacing: 0.05em; line-height: 1.5;
+  color: rgba(245,242,232,0.55);
+  max-width: 440px; margin: 2rem 0 3rem;
+  opacity: 0; animation: slide-right 0.7s 0.5s ease forwards;
+}
+
+.hero-actions {
+  display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap;
+  opacity: 0; animation: slide-right 0.7s 0.65s ease forwards;
+}
+.btn-primary {
+  font-family: var(--f-cond); font-size: 0.85rem; font-weight: 900;
+  letter-spacing: 0.25em; text-transform: uppercase; text-decoration: none;
+  background: var(--yellow); color: var(--black);
+  padding: 1rem 2.8rem;
+  display: inline-block; position: relative;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  transition: background 0.2s, transform 0.1s;
+}
+.btn-primary:hover { background: var(--yellow2); transform: translateY(-2px); }
+.btn-ghost {
+  font-family: var(--f-cond); font-size: 0.75rem; font-weight: 700;
+  letter-spacing: 0.25em; text-transform: uppercase; text-decoration: none;
+  color: rgba(245,242,232,0.6);
+  display: flex; align-items: center; gap: 0.6rem;
+  transition: color 0.2s;
+}
+.btn-ghost:hover { color: var(--yellow); }
+.btn-ghost::after { content: '→'; font-size: 1.1rem; }
+
+.hero-stats {
+  display: flex; gap: 0;
+  margin-top: 3.5rem;
+  border-top: 1px solid rgba(245,242,232,0.08);
+  padding-top: 2rem;
+  opacity: 0; animation: slide-right 0.7s 0.8s ease forwards;
+}
+.hstat {
+  padding: 0 2rem 0 0; margin-right: 2rem;
+  border-right: 1px solid rgba(245,242,232,0.1);
+}
+.hstat:last-child { border-right: none; }
+.hstat-num {
+  font-family: var(--f-display); font-size: 2.2rem;
+  color: var(--yellow); line-height: 1;
+  display: block;
+}
+.hstat-label {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 600;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: rgba(245,242,232,0.4);
+  display: block; margin-top: 0.2rem;
+}
+
+/* Hero right — product can visual */
+.hero-right {
+  display: flex; align-items: center; justify-content: center;
+  position: relative; min-height: 560px;
+}
+
+/* Glow behind can */
+.can-bg-glow {
+  position: absolute; width: 400px; height: 400px;
+  background: radial-gradient(circle, rgba(220,220,220,0.18) 0%, transparent 65%);
+  filter: blur(60px);
+  animation: pulse-glow 3s ease-in-out infinite;
+}
+@keyframes pulse-glow { 0%,100%{opacity:0.6} 50%{opacity:1} }
+
+/* Rotating ring */
+.can-ring {
+  position: absolute; width: 380px; height: 380px;
+  border: 1px solid rgba(217,26,10,0.2);
+  border-radius: 50%;
+  animation: spin 25s linear infinite;
+}
+.can-ring::before {
+  content: '◆'; position: absolute; top: -8px; left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.6rem; color: var(--yellow);
+}
+.can-ring-2 {
+  position: absolute; width: 460px; height: 460px;
+  border: 1px dashed rgba(217,26,10,0.1);
+  border-radius: 50%;
+  animation: spin 40s linear infinite reverse;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* The real product can */
+.apex-can {
+  position: relative; z-index: 2;
+  width: 300px;
+  opacity: 0; animation: can-enter 0.8s 0.9s ease forwards, can-float 5s 1.7s ease-in-out infinite;
+}
+@keyframes can-enter {
+  from { opacity: 0; transform: translateY(40px) scale(0.95); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes can-float {
+  0%,100% { transform: translateY(0) rotate(-1deg); }
+  50%     { transform: translateY(-18px) rotate(1deg); }
+}
+.apex-can img {
+  width: 100%; display: block;
+  filter: drop-shadow(0 40px 60px rgba(0,0,0,0.85)) drop-shadow(0 0 40px rgba(217,26,10,0.2));
+}
+
+/* Hero ticker at bottom */
+.hero-ticker {
+  position: relative; z-index: 10;
+  background: var(--black); padding: 0.6rem 0;
+  overflow: hidden; border-top: 2px solid var(--yellow);
+  white-space: nowrap;
+}
+.ticker-track {
+  display: inline-flex; gap: 0;
+  animation: ticker 25s linear infinite;
+}
+.ticker-item {
+  font-family: var(--f-cond); font-size: 0.7rem; font-weight: 900;
+  letter-spacing: 0.3em; text-transform: uppercase;
+  color: var(--white); padding: 0 2rem;
+}
+.ticker-sep { color: var(--yellow); }
+@keyframes ticker { from{transform:translateX(0)} to{transform:translateX(-50%)} }
+
+/* ═══════ MISSION SECTION ═══════ */
+.mission {
+  background: var(--white);
+  padding: 8rem 3rem;
+  position: relative; overflow: hidden;
+}
+.mission-inner {
+  max-width: 1200px; margin: 0 auto;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6rem; align-items: center;
+}
+.mission-num {
+  font-family: var(--f-display); font-size: 18rem; line-height: 1;
+  color: transparent; -webkit-text-stroke: 1px var(--lgray);
+  position: absolute; left: -2rem; top: 0;
+  pointer-events: none; user-select: none;
+  opacity: 0.4;
+}
+.mission-label {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 700;
+  letter-spacing: 0.5em; text-transform: uppercase;
+  color: var(--red);
+  display: flex; align-items: center; gap: 0.7rem; margin-bottom: 1rem;
+}
+.mission-label::before { content: ''; display: block; width: 24px; height: 2px; background: var(--red); }
+.mission-h2 {
+  font-family: var(--f-display);
+  font-size: clamp(3.5rem, 6vw, 5.5rem); line-height: 0.92;
+  letter-spacing: 0.01em;
+}
+.mission-h2 em { font-style: normal; color: var(--red); }
+.mission-body {
+  font-size: 1.05rem; font-weight: 300; line-height: 1.8;
+  color: #444440; margin-top: 2rem; max-width: 440px;
+}
+.mission-quote {
+  border-left: 4px solid var(--yellow);
+  padding: 1.5rem 2rem; background: var(--off);
+  margin-top: 2.5rem;
+}
+.mission-quote p {
+  font-family: var(--f-cond); font-size: 1.3rem; font-style: italic;
+  font-weight: 300; line-height: 1.5; color: var(--charcoal);
+}
+
+/* Right side: stats grid */
+.mission-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 2px;
+}
+.mgrid-cell {
+  background: var(--black); padding: 2.5rem 2rem;
+  position: relative; overflow: hidden; cursor: none;
+  transition: transform 0.2s;
+}
+.mgrid-cell:hover { transform: scale(1.02); z-index: 1; }
+.mgrid-cell.yellow { background: var(--yellow); }
+.mgrid-cell.yellow .mgrid-num { color: var(--white); }
+.mgrid-cell.yellow .mgrid-lbl { color: rgba(255,255,255,0.6); }
+.mgrid-cell.yellow .mgrid-desc { color: rgba(255,255,255,0.7); }
+.mgrid-num {
+  font-family: var(--f-display); font-size: 3.5rem; line-height: 1;
+  color: var(--yellow); display: block;
+}
+.mgrid-lbl {
+  font-family: var(--f-cond); font-size: 0.6rem; font-weight: 700;
+  letter-spacing: 0.3em; text-transform: uppercase;
+  color: rgba(245,242,232,0.4); display: block; margin-top: 0.3rem;
+}
+.mgrid-desc {
+  font-size: 0.82rem; line-height: 1.5;
+  color: rgba(245,242,232,0.5); margin-top: 0.8rem;
+}
+
+/* ═══════ FLAVORS ═══════ */
+.flavors {
+  background: var(--black);
+  padding: 8rem 3rem;
+}
+.flavors-inner { max-width: 1200px; margin: 0 auto; }
+.section-header {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  margin-bottom: 4rem; flex-wrap: wrap; gap: 1rem;
+}
+.sh-left {}
+.sh-label {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 700;
+  letter-spacing: 0.5em; text-transform: uppercase;
+  color: var(--yellow); margin-bottom: 0.5rem;
+}
+.sh-title {
+  font-family: var(--f-display);
+  font-size: clamp(3rem, 5vw, 4.5rem); line-height: 0.95;
+  color: var(--white); letter-spacing: 0.01em;
+}
+.sh-title em { font-style: normal; color: var(--yellow); }
+.sh-right {
+  font-family: var(--f-cond); font-size: 0.8rem; font-weight: 300;
+  color: rgba(245,242,232,0.4); max-width: 280px; line-height: 1.6;
+}
+
+.flavors-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px;
+}
+.flavor-card {
+  position: relative; overflow: hidden; cursor: none;
+  aspect-ratio: 2/3; background: var(--charcoal);
+  display: flex; flex-direction: column; justify-content: flex-end;
+  padding: 1.8rem;
+  transition: transform 0.3s;
+}
+.flavor-card:hover { transform: scale(1.03); z-index: 1; }
+.flavor-card::before {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, transparent 30%, rgba(0,0,0,0.85) 100%);
+  z-index: 1;
+}
+.flavor-bg {
+  position: absolute; inset: 0; z-index: 0;
+  transition: transform 0.4s ease;
+}
+.flavor-card:hover .flavor-bg { transform: scale(1.06); }
+.fc-citrus .flavor-bg { background: linear-gradient(135deg, #2a2200, #3d3800, #1a1500); }
+.fc-storm  .flavor-bg { background: linear-gradient(135deg, #001a2a, #002233, #000f1a); }
+.fc-fire   .flavor-bg { background: linear-gradient(135deg, #2a0800, #3d1000, #1a0500); }
+.fc-frost  .flavor-bg { background: linear-gradient(135deg, #001a1a, #002222, #000f0f); }
+
+/* Large translucent letter */
+.flavor-letter {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -55%);
+  font-family: var(--f-display); font-size: 9rem; line-height: 1;
+  opacity: 0.08; z-index: 1; pointer-events: none; letter-spacing: -0.05em;
+}
+.fc-citrus .flavor-letter { color: var(--yellow); }
+.fc-storm  .flavor-letter { color: #40a8ff; }
+.fc-fire   .flavor-letter { color: var(--red); }
+.fc-frost  .flavor-letter { color: #a0f0f0; }
+
+.flavor-content { position: relative; z-index: 2; }
+.flavor-tag {
+  font-family: var(--f-cond); font-size: 0.55rem; font-weight: 700;
+  letter-spacing: 0.4em; text-transform: uppercase;
+  margin-bottom: 0.5rem; display: block;
+}
+.fc-citrus .flavor-tag { color: var(--yellow); }
+.fc-storm  .flavor-tag { color: #40a8ff; }
+.fc-fire   .flavor-tag { color: var(--red); }
+.fc-frost  .flavor-tag { color: #a0f0f0; }
+
+.flavor-name {
+  font-family: var(--f-display); font-size: 2rem; line-height: 1; letter-spacing: 0.02em;
+  color: var(--white); display: block; margin-bottom: 0.5rem;
+}
+.flavor-desc {
+  font-size: 0.78rem; line-height: 1.5; color: rgba(245,242,232,0.5);
+  font-weight: 300;
+}
+.flavor-tag-pill {
+  display: inline-block; margin-top: 0.8rem;
+  font-family: var(--f-cond); font-size: 0.55rem; font-weight: 700;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  background: rgba(245,242,232,0.08); color: rgba(245,242,232,0.6);
+  padding: 0.25rem 0.7rem;
+}
+
+/* ═══════ HOW IT WORKS ═══════ */
+.how {
+  background: var(--white);
+  padding: 8rem 3rem;
+}
+.how-inner { max-width: 1200px; margin: 0 auto; }
+
+.how-steps {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  margin-top: 5rem; gap: 0;
+  border: 2px solid var(--black);
+}
+.step {
+  padding: 3rem 2.5rem;
+  border-right: 2px solid var(--black);
+  position: relative;
+  transition: background 0.3s;
+}
+.step:last-child { border-right: none; }
+.step:hover { background: var(--black); }
+.step:hover .step-num { color: var(--yellow); -webkit-text-stroke-color: var(--yellow); }
+.step:hover .step-title { color: var(--white); }
+.step:hover .step-body { color: rgba(245,242,232,0.5); }
+.step:hover .step-icon { background: var(--yellow); color: var(--black); }
+
+.step-num {
+  font-family: var(--f-display); font-size: 5rem; line-height: 1;
+  color: transparent; -webkit-text-stroke: 1.5px var(--lgray);
+  display: block; transition: color 0.3s, -webkit-text-stroke-color 0.3s;
+}
+.step-icon {
+  width: 48px; height: 48px;
+  background: var(--black); color: var(--yellow);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.3rem; margin: 1.5rem 0 1rem;
+  transition: background 0.3s, color 0.3s;
+  clip-path: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 8px 100%, 0 calc(100% - 8px));
+}
+.step-title {
+  font-family: var(--f-cond); font-size: 1.3rem; font-weight: 700;
+  letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--black); transition: color 0.3s; margin-bottom: 0.8rem;
+}
+.step-body {
+  font-size: 0.88rem; line-height: 1.7; color: #555550;
+  font-weight: 300; transition: color 0.3s;
+}
+
+/* ═══════ PROOF / TESTIMONIALS ═══════ */
+.proof {
+  background: var(--off);
+  padding: 8rem 3rem;
+  border-top: 2px solid var(--black); border-bottom: 2px solid var(--black);
+}
+.proof-inner { max-width: 1200px; margin: 0 auto; }
+.proof-grid {
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0;
+  margin-top: 4rem; border: 2px solid var(--black);
+}
+.proof-card {
+  padding: 3rem 2.5rem;
+  border-right: 2px solid var(--black);
+  position: relative; overflow: hidden;
+  transition: background 0.25s;
+}
+.proof-card:hover { background: var(--black); }
+.proof-card:last-child { border-right: none; }
+.proof-card:hover .proof-text { color: rgba(245,242,232,0.7); }
+.proof-card:hover .proof-name { color: var(--white); }
+.proof-card:hover .proof-role { color: rgba(245,242,232,0.4); }
+.proof-card:hover .proof-stars { color: var(--yellow); }
+.proof-stars { font-size: 0.7rem; letter-spacing: 0.3em; color: #B0AD98; margin-bottom: 1.5rem; transition: color 0.25s; }
+.proof-text {
+  font-family: var(--f-cond); font-size: 1.15rem; font-weight: 300;
+  font-style: italic; line-height: 1.6; color: #333330;
+  margin-bottom: 2rem; transition: color 0.25s;
+}
+.proof-name {
+  font-family: var(--f-cond); font-size: 0.8rem; font-weight: 700;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--black); transition: color 0.25s;
+}
+.proof-role {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 400;
+  letter-spacing: 0.15em; text-transform: uppercase;
+  color: var(--gray); margin-top: 0.2rem; transition: color 0.25s;
+}
+
+/* Big number bar */
+.proof-bignum {
+  display: grid; grid-template-columns: repeat(4,1fr); gap: 0;
+  border: 2px solid var(--black); border-top: none;
+  background: var(--black);
+}
+.pbn-item {
+  padding: 2.5rem 2rem; border-right: 2px solid rgba(255,255,255,0.06);
+  text-align: center;
+}
+.pbn-item:last-child { border-right: none; }
+.pbn-num {
+  font-family: var(--f-display); font-size: 3rem; line-height: 1;
+  color: var(--yellow); display: block;
+}
+.pbn-lbl {
+  font-family: var(--f-cond); font-size: 0.6rem; font-weight: 600;
+  letter-spacing: 0.3em; text-transform: uppercase;
+  color: rgba(245,242,232,0.3); display: block; margin-top: 0.3rem;
+}
+
+/* ═══════ CTA BAND ═══════ */
+.cta-band {
+  background: var(--yellow);
+  padding: 6rem 3rem;
+  position: relative; overflow: hidden;
+}
+.cta-band-bg {
+  position: absolute; inset: 0;
+  background-image: repeating-linear-gradient(
+    -55deg,
+    transparent,
+    transparent 40px,
+    rgba(0,0,0,0.04) 40px,
+    rgba(0,0,0,0.04) 42px
+  );
+}
+.cta-band-inner {
+  max-width: 1000px; margin: 0 auto; position: relative; z-index: 1;
+  display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4rem;
+  flex-wrap: wrap;
+}
+.cta-band h2 {
+  font-family: var(--f-display);
+  font-size: clamp(3.5rem, 7vw, 6rem); line-height: 0.9;
+  color: var(--white); letter-spacing: 0.01em;
+}
+.cta-band h2 .ghost {
+  -webkit-text-stroke: 2px var(--white); color: transparent;
+}
+.cta-band-right { display: flex; flex-direction: column; gap: 1rem; align-items: flex-start; }
+.cta-band-right p {
+  font-size: 0.9rem; font-weight: 300; line-height: 1.7;
+  color: rgba(255,255,255,0.65); max-width: 280px;
+}
+.btn-dark {
+  font-family: var(--f-cond); font-size: 0.85rem; font-weight: 900;
+  letter-spacing: 0.25em; text-transform: uppercase; text-decoration: none;
+  background: var(--white); color: var(--black);
+  padding: 1rem 2.5rem; display: inline-block;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  transition: background 0.2s;
+}
+.btn-dark:hover { background: var(--off); }
+
+/* ═══════ GOOGLE DRIVE EXPORT ═══════ */
+.gdrive-fab {
+  position: fixed; bottom: 2rem; right: 2rem; z-index: 1000;
+  display: flex; align-items: center; gap: 0.7rem;
+  background: var(--white); color: var(--black);
+  border: none; padding: 0.75rem 1.4rem;
+  font-family: var(--f-cond); font-size: 0.68rem; font-weight: 900;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  cursor: pointer; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+  transition: transform 0.2s, box-shadow 0.2s;
+  animation: fabEnter 0.6s 1.5s ease both;
+}
+@keyframes fabEnter { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+.gdrive-fab:hover { transform: translateY(-2px); box-shadow: 0 12px 40px rgba(0,0,0,0.5); }
+.gdrive-fab svg { width: 18px; height: 18px; flex-shrink: 0; }
+
+/* Export Modal */
+.gdrive-modal-overlay {
+  position: fixed; inset: 0; z-index: 2000;
+  background: rgba(0,0,0,0.85); backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.25s;
+}
+.gdrive-modal-overlay.open { opacity: 1; pointer-events: all; }
+.gdrive-modal {
+  background: var(--charcoal);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-top: 3px solid var(--yellow);
+  width: 100%; max-width: 520px; margin: 1rem;
+  transform: translateY(20px);
+  transition: transform 0.25s;
+}
+.gdrive-modal-overlay.open .gdrive-modal { transform: translateY(0); }
+.gm-header {
+  padding: 2rem 2.5rem 1.5rem;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.gm-title-row { display: flex; align-items: center; gap: 0.8rem; }
+.gm-title {
+  font-family: var(--f-display); font-size: 1.6rem; letter-spacing: 0.05em; color: var(--white);
+}
+.gm-subtitle {
+  font-family: var(--f-cond); font-size: 0.6rem; font-weight: 600;
+  letter-spacing: 0.3em; text-transform: uppercase; color: var(--gray); margin-top: 0.1rem;
+}
+.gm-close {
+  background: none; border: none; color: var(--gray); font-size: 1.4rem;
+  cursor: pointer; line-height: 1; padding: 0.2rem; transition: color 0.2s;
+}
+.gm-close:hover { color: var(--white); }
+.gm-body { padding: 2rem 2.5rem; }
+.gm-desc {
+  font-size: 0.88rem; font-weight: 300; line-height: 1.7;
+  color: rgba(248,248,248,0.5); margin-bottom: 2rem;
+}
+.gm-files {
+  list-style: none; margin-bottom: 2rem;
+  border: 1px solid rgba(255,255,255,0.07);
+}
+.gm-file {
+  display: flex; align-items: center; gap: 0.8rem;
+  padding: 0.8rem 1.2rem;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  font-family: var(--f-cond); font-size: 0.72rem; font-weight: 600;
+  letter-spacing: 0.1em; color: rgba(248,248,248,0.6);
+}
+.gm-file:last-child { border-bottom: none; }
+.gm-file-icon { font-size: 1rem; flex-shrink: 0; }
+.gm-file-name { flex: 1; }
+.gm-file-size { font-size: 0.6rem; color: var(--gray); }
+.gm-file-status { font-size: 0.6rem; letter-spacing: 0.2em; text-transform: uppercase; }
+.gm-file-status.done { color: #4CAF50; }
+.gm-file-status.waiting { color: var(--gray); }
+.gm-file-status.uploading { color: var(--yellow); animation: pulse-txt 1s ease-in-out infinite; }
+@keyframes pulse-txt { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+.gm-progress-bar-wrap {
+  height: 3px; background: rgba(255,255,255,0.08); margin-bottom: 1.8rem; display: none;
+}
+.gm-progress-bar {
+  height: 100%; background: var(--yellow); width: 0%;
+  transition: width 0.4s ease;
+}
+.gm-actions { display: flex; gap: 1rem; flex-wrap: wrap; }
+.gm-btn-primary {
+  font-family: var(--f-cond); font-size: 0.72rem; font-weight: 900;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  background: var(--yellow); color: var(--white);
+  border: none; padding: 0.85rem 2rem; cursor: pointer;
+  clip-path: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 8px 100%, 0 calc(100% - 8px));
+  transition: background 0.2s; display: flex; align-items: center; gap: 0.5rem;
+}
+.gm-btn-primary:hover { background: var(--yellow2); }
+.gm-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.gm-btn-secondary {
+  font-family: var(--f-cond); font-size: 0.72rem; font-weight: 700;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  background: none; color: rgba(248,248,248,0.5);
+  border: 1px solid rgba(255,255,255,0.15); padding: 0.85rem 1.5rem; cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+.gm-btn-secondary:hover { border-color: var(--white); color: var(--white); }
+.gm-status-msg {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 600;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--gray); margin-top: 1.2rem; min-height: 1.2rem;
+  display: flex; align-items: center; gap: 0.5rem;
+}
+.gm-status-msg.success { color: #4CAF50; }
+.gm-status-msg.error { color: var(--yellow); }
+
+/* ═══════ FOOTER ═══════ */
+footer {
+  background: var(--black);
+  padding: 5rem 3rem 3rem;
+  border-top: 2px solid var(--yellow);
+}
+.footer-inner { max-width: 1200px; margin: 0 auto; }
+.footer-top {
+  display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 4rem;
+  padding-bottom: 4rem; border-bottom: 1px solid rgba(255,255,255,0.08);
+  flex-wrap: wrap;
+}
+.footer-brand-logo {
+  font-family: var(--f-display); font-size: 2.5rem; letter-spacing: 0.05em;
+  color: var(--yellow); line-height: 1; margin-bottom: 1rem; display: block;
+}
+.footer-brand-text {
+  font-size: 0.85rem; font-weight: 300; line-height: 1.7;
+  color: rgba(245,242,232,0.4); max-width: 260px;
+}
+.footer-col-title {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 700;
+  letter-spacing: 0.4em; text-transform: uppercase;
+  color: var(--yellow); margin-bottom: 1.5rem; display: block;
+}
+.footer-links { list-style: none; display: flex; flex-direction: column; gap: 0.7rem; }
+.footer-links a {
+  font-family: var(--f-cond); font-size: 0.85rem; font-weight: 300;
+  letter-spacing: 0.05em; color: rgba(245,242,232,0.45); text-decoration: none;
+  transition: color 0.2s;
+}
+.footer-links a:hover { color: var(--white); }
+.footer-bottom {
+  display: flex; justify-content: space-between; align-items: center;
+  padding-top: 2rem; flex-wrap: wrap; gap: 1rem;
+}
+.footer-copy {
+  font-family: var(--f-cond); font-size: 0.65rem; font-weight: 400;
+  letter-spacing: 0.15em; text-transform: uppercase;
+  color: rgba(245,242,232,0.2);
+}
+.footer-socials { display: flex; gap: 1rem; }
+.footer-socials a {
+  width: 36px; height: 36px;
+  border: 1px solid rgba(255,255,255,0.1);
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--f-cond); font-size: 0.7rem; font-weight: 700;
+  color: rgba(245,242,232,0.4); text-decoration: none;
+  transition: all 0.2s;
+}
+.footer-socials a:hover { border-color: var(--yellow); color: var(--yellow); }
+
+/* ═══════ SCROLL REVEAL ═══════ */
+.reveal { opacity: 0; transform: translateY(32px); transition: opacity 0.7s ease, transform 0.7s ease; }
+.reveal.up { opacity: 1; transform: none; }
+.reveal-left { opacity: 0; transform: translateX(-32px); transition: opacity 0.7s ease, transform 0.7s ease; }
+.reveal-left.up { opacity: 1; transform: none; }
+.reveal-right { opacity: 0; transform: translateX(32px); transition: opacity 0.7s ease, transform 0.7s ease; }
+.reveal-right.up { opacity: 1; transform: none; }
+.d1 { transition-delay: 0.1s; }
+.d2 { transition-delay: 0.2s; }
+.d3 { transition-delay: 0.3s; }
+.d4 { transition-delay: 0.4s; }
+
+/* ═══════ MOBILE ═══════ */
+@media (max-width: 960px) {
+  .hero-inner { grid-template-columns: 1fr; padding: 3rem 2rem; }
+  .hero-right { display: none; }
+  .hero-slash { display: none; }
+  .mission-inner { grid-template-columns: 1fr; gap: 3rem; }
+  .mission-num { display: none; }
+  .flavors-grid { grid-template-columns: 1fr 1fr; }
+  .how-steps { grid-template-columns: 1fr; }
+  .step { border-right: none; border-bottom: 2px solid var(--black); }
+  .step:last-child { border-bottom: none; }
+  .proof-grid { grid-template-columns: 1fr; }
+  .proof-card { border-right: none; border-bottom: 2px solid var(--black); }
+  .proof-bignum { grid-template-columns: 1fr 1fr; }
+  .cta-band-inner { grid-template-columns: 1fr; }
+  .footer-top { grid-template-columns: 1fr 1fr; gap: 2rem; }
+  nav { padding: 0 1.5rem; }
+  .nav-center { display: none; }
+}
+
+@keyframes slide-right {
+  from { opacity: 0; transform: translateX(-30px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script></head>
+<body id="artifacts-component-root-html" style="overflow: hidden;">
+
+<!-- Cursor -->
+<div id="cursor"></div>
+<div id="cursor-ring"></div>
+
+<!-- ═══════ NAV ═══════ -->
+<nav>
+  <div class="nav-logo">NITRICX<sup>™</sup></div>
+  <div class="nav-center">
+    <a href="products.html">Products</a>
+    <a href="#how">Science</a>
+    <a href="#proof">Performance</a>
+    <a href="#buy">Shop</a>
+  </div>
+  <div class="nav-right">
+    <span class="nav-tag">S7 Formula™</span>
+    <a href="#buy" class="btn-nav">Order Now</a>
+  </div>
+</nav>
+
+<!-- ═══════ HERO ═══════ -->
+<section class="hero">
+  <div class="hero-inner">
+
+    <div class="hero-left">
+      <p class="hero-kicker">S7 Formula™ · Powered by Nitric Oxide</p>
+      <h1 class="hero-h1">
+        <span>FUEL</span>
+        <span class="accent">YOUR</span>
+        <span class="stroke">PEAK</span>
+        <span>POTENTIAL.</span>
+      </h1>
+      <p class="hero-sub">Powered by nitric oxide, fueled by science. NitricX is the next generational drink that will change how you feel and how fast you recover. Perform at your absolute peak.</p>
+      <div class="hero-actions">
+        <a href="#buy" class="btn-primary">Shop Now</a>
+        <a href="#how" class="btn-ghost">Learn More</a>
+      </div>
+      <div class="hero-stats">
+        <div class="hstat">
+          <span class="hstat-num" data-done="1">230%</span>
+          <span class="hstat-label">Blood Oxygenation</span>
+        </div>
+        <div class="hstat">
+          <span class="hstat-num" data-done="1">0</span>
+          <span class="hstat-label">Artificial Sweeteners</span>
+        </div>
+        <div class="hstat">
+          <span class="hstat-num" data-done="1">100%</span>
+          <span class="hstat-label">Natural Ingredients</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-right">
+      <div class="can-bg-glow"></div>
+      <div class="can-ring"></div>
+      <div class="can-ring-2"></div>
+      <div class="apex-can">
+        <img src="Skinny_transparent.png" alt="NitricX Can">
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Ticker -->
+  <div class="hero-ticker">
+    <div class="ticker-track">
+      <span class="ticker-item">S7 Patented Formula</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">230% Blood Oxygenation</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">100% Natural Ingredients</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Zero Artificial Sweeteners</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Stimulant Free</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Faster Recovery</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Extended Endurance</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">S7 Patented Formula</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">230% Blood Oxygenation</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">100% Natural Ingredients</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Zero Artificial Sweeteners</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Stimulant Free</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Faster Recovery</span><span class="ticker-sep"> · </span>
+      <span class="ticker-item">Extended Endurance</span><span class="ticker-sep"> · </span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ MISSION ═══════ -->
+<section class="mission">
+  <div class="mission-inner">
+    <div style="position:relative;">
+      <div class="mission-num" aria-hidden="true">S7</div>
+      <span class="mission-label reveal up">Powered by Nitric Oxide</span>
+      <h2 class="mission-h2 reveal d1 up">SCIENCE<br><em>THAT PERFORMS.</em></h2>
+      <p class="mission-body reveal d2 up">
+        NitricX uses the patented S7 formula — a blend of seven plant-based ingredients clinically shown to increase nitric oxide production. More nitric oxide means wider blood vessels, more oxygen to your muscles, and unstoppable performance. Whether you're an athlete pushing your limits or someone looking to stay energized throughout the day, NitricX is formulated to help you perform at your absolute best.
+      </p>
+      <blockquote class="mission-quote reveal d3 up">
+        <p>"The new generational drink that will change how you feel and how fast you recover."</p>
+      </blockquote>
+    </div>
+
+    <div class="mission-grid reveal-right d1 up">
+      <div class="mgrid-cell yellow">
+        <span class="mgrid-num" data-done="1">230%</span>
+        <span class="mgrid-lbl">Blood Oxygenation</span>
+        <p class="mgrid-desc">S7 formula increases nitric oxide production, boosting blood oxygen levels for sustained peak performance.</p>
+      </div>
+      <div class="mgrid-cell">
+        <span class="mgrid-num" data-done="1">7S</span>
+        <span class="mgrid-lbl">Patented Formula</span>
+        <p class="mgrid-desc">Seven plant-based ingredients clinically proven to maximize nitric oxide. Approved since 2019.</p>
+      </div>
+      <div class="mgrid-cell">
+        <span class="mgrid-num" data-done="1">100%</span>
+        <span class="mgrid-lbl">Natural Ingredients</span>
+        <p class="mgrid-desc">Crafted entirely from natural sources. No synthetics, no shortcuts — just clean, proven performance.</p>
+      </div>
+      <div class="mgrid-cell">
+        <span class="mgrid-num" data-done="1">0</span>
+        <span class="mgrid-lbl">Artificial Sweeteners</span>
+        <p class="mgrid-desc">Zero artificial sweeteners, zero compromise. Great taste without the metabolic cost.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ FLAVORS ═══════ -->
+<section class="flavors" id="flavors">
+  <div class="flavors-inner">
+    <div class="section-header reveal up">
+      <div class="sh-left">
+        <p class="sh-label">Our Collection</p>
+        <h2 class="sh-title">PREMIUM FORMULAS<br><em>FOR PEAK PERFORMANCE.</em></h2>
+      </div>
+      <p class="sh-right">Every product is built on the patented S7™ complex. The formula stays elite. The purpose changes.</p>
+    </div>
+
+    <div class="flavors-grid">
+      <div class="flavor-card fc-citrus reveal d1 up" onclick="location.href='nitricx-original.html'" style="cursor:pointer;">
+        <div class="flavor-bg"></div>
+        <div class="flavor-letter">O</div>
+        <div class="flavor-content">
+          <span class="flavor-tag">Bestseller</span>
+          <span class="flavor-name">NitricX Original</span>
+          <p class="flavor-desc">Pure performance. The flagship formula. S7™ Complex for 230% NO boost — zero stimulants, full electrolyte replenishment.</p>
+          <span class="flavor-tag-pill">S7™ · Zero Stimulants</span>
+        </div>
+      </div>
+      <div class="flavor-card fc-storm reveal d2 up" onclick="location.href='nitricx-black.html'" style="cursor:pointer;">
+        <div class="flavor-bg"></div>
+        <div class="flavor-letter">B</div>
+        <div class="flavor-content">
+          <span class="flavor-tag">Max Power</span>
+          <span class="flavor-name">NitricX Black</span>
+          <p class="flavor-desc">Maximum intensity for elite athletes. Double-Strength S7™ complex with L-Citrulline and Arginine Nitrate for enhanced vasodilation.</p>
+          <span class="flavor-tag-pill">Double S7™ · L-Citrulline</span>
+        </div>
+      </div>
+      <div class="flavor-card fc-fire reveal d3 up" onclick="location.href='nitricx-purple.html'" style="cursor:pointer;">
+        <div class="flavor-bg"></div>
+        <div class="flavor-letter">P</div>
+        <div class="flavor-content">
+          <span class="flavor-tag">Recovery</span>
+          <span class="flavor-name">NitricX Purple</span>
+          <p class="flavor-desc">Optimized for recovery and regeneration. S7™ + BCAA Recovery Blend with full-spectrum electrolytes to reduce muscle soreness.</p>
+          <span class="flavor-tag-pill">BCAAs · Full Electrolytes</span>
+        </div>
+      </div>
+      <div class="flavor-card fc-frost reveal d4 up" onclick="location.href='nitricx-pump.html'" style="cursor:pointer;">
+        <div class="flavor-bg"></div>
+        <div class="flavor-letter">+</div>
+        <div class="flavor-content">
+          <span class="flavor-tag">New Release</span>
+          <span class="flavor-name">NitricX Pump</span>
+          <p class="flavor-desc">Built for the elite. Engineered to dominate. High-dose L-Citrulline and Glycerol for maximum vascularity and unrivaled muscle fullness.</p>
+          <span class="flavor-tag-pill">Glycerol · Stimulant-Free</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ HOW IT WORKS ═══════ -->
+<section class="how" id="how">
+  <div class="how-inner">
+    <div class="section-header reveal up">
+      <div class="sh-left" style="color:var(--black)">
+        <p class="sh-label" style="color:var(--red)">The Science</p>
+        <h2 class="sh-title" style="color:var(--black)">HOW NITRICX<br><em style="color:var(--red)">WORKS.</em></h2>
+      </div>
+      <p class="sh-right" style="color:#666666">Four pillars. One unstoppable formula. From the moment you open the can to your next personal best.</p>
+    </div>
+
+    <div class="how-steps">
+      <div class="step reveal d1">
+        <span class="step-num">01</span>
+        <div class="step-icon">⚡</div>
+        <p class="step-title">Blood Oxygenation</p>
+        <p class="step-body">The S7 formula increases nitric oxide production, boosting blood oxygen levels by up to 230% for sustained performance. Wider blood vessels mean more oxygen reaching your muscles precisely when it matters most.</p>
+      </div>
+      <div class="step reveal d2">
+        <span class="step-num">02</span>
+        <div class="step-icon">🔥</div>
+        <p class="step-title">Extended Endurance</p>
+        <p class="step-body">Enjoy your workouts longer and completely stimulant-free. Sustained vasodilation extends your performance window naturally — no synthetic caffeine spike, no crash, just consistent output from first rep to last.</p>
+      </div>
+      <div class="step reveal d3">
+        <span class="step-num">03</span>
+        <div class="step-icon">↑</div>
+        <p class="step-title">Faster Recovery</p>
+        <p class="step-body">Enhanced oxygen delivery means faster muscle recovery. Get back to training sooner, push harder every session. The BCAA recovery blend reduces muscle soreness so tomorrow's session is never compromised by today's.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ PROOF ═══════ -->
+<section class="proof" id="proof">
+  <div class="proof-inner">
+    <div class="section-header reveal">
+      <div class="sh-left" style="color:var(--black)">
+        <p class="sh-label" style="color:var(--red)">Performance</p>
+        <h2 class="sh-title" style="color:var(--black)">STAMINA<br><em style="color:var(--red)">THAT LASTS.</em></h2>
+      </div>
+      <p class="sh-right" style="color:#666666">Whether you're an athlete pushing your limits or someone looking to stay energized throughout the day — NitricX is formulated to help you perform at your best.</p>
+    </div>
+
+    <div class="proof-grid reveal d1">
+      <div class="proof-card">
+        <div class="proof-stars">★★★★★</div>
+        <p class="proof-text">"You don't feel it until you need oxygen during your workout — then you realize you just don't get tired. That's the S7. I've never experienced anything like it in ten years of competing."</p>
+        <p class="proof-name">Marcus T.</p>
+        <p class="proof-role">Competitive Cyclist · 3x Regional Champion</p>
+      </div>
+      <div class="proof-card">
+        <div class="proof-stars">★★★★★</div>
+        <p class="proof-text">"NitricX Black before every heavy session. The vasodilation is real — you can feel the difference in your pump within 20 minutes. My lifts went up. My recovery went down. This is the formula."</p>
+        <p class="proof-name">Jordan V.</p>
+        <p class="proof-role">Powerlifter · USAPL Open Division</p>
+      </div>
+      <div class="proof-card">
+        <div class="proof-stars">★★★★★</div>
+        <p class="proof-text">"I switched to NitricX Purple for recovery days and the muscle soreness drop was immediate. Full-spectrum electrolytes, BCAAs, and no junk — it's the only post-workout drink I trust now."</p>
+        <p class="proof-name">Alicia R.</p>
+        <p class="proof-role">CrossFit Athlete · Masters Division</p>
+      </div>
+    </div>
+
+    <div class="proof-bignum reveal d2">
+      <div class="pbn-item">
+        <span class="pbn-num">95%</span>
+        <span class="pbn-lbl">Endurance Boost</span>
+      </div>
+      <div class="pbn-item">
+        <span class="pbn-num">88%</span>
+        <span class="pbn-lbl">Endurance Improvement</span>
+      </div>
+      <div class="pbn-item">
+        <span class="pbn-num">82%</span>
+        <span class="pbn-lbl">Faster Recovery Speed</span>
+      </div>
+      <div class="pbn-item">
+        <span class="pbn-num">230%</span>
+        <span class="pbn-lbl">Blood Oxygenation Boost</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ CTA BAND ═══════ -->
+<section class="cta-band" id="buy">
+  <div class="cta-band-bg"></div>
+  <div class="cta-band-inner">
+    <h2 class="reveal">
+      FUEL<br>YOUR<br><span class="ghost">POTENTIAL.</span>
+    </h2>
+    <div class="cta-band-right reveal-right">
+      <p>Join thousands of athletes who have elevated their game with NitricX. Your next personal best starts here. Free shipping on all orders.</p>
+      <a href="#" class="btn-dark">Order Now</a>
+      <a href="#" class="btn-dark" style="background: transparent; border: 1px solid rgba(255,255,255,0.4); color: var(--white); margin-top: -0.5rem;">Find a Store</a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ FOOTER ═══════ -->
+<footer>
+  <div class="footer-inner">
+    <div class="footer-top">
+      <div>
+        <span class="footer-brand-logo">NITRICX</span>
+        <p class="footer-brand-text">The next generation performance drink. Powered by S7 nitric oxide formula. Crafted with 100% natural ingredients. S7 Formula™ approved since 2019.</p>
+      </div>
+      <div>
+        <span class="footer-col-title">Drinks</span>
+        <ul class="footer-links">
+          <li><a href="#">NitricX Original</a></li>
+          <li><a href="#">NitricX Black</a></li>
+          <li><a href="#">NitricX Purple</a></li>
+          <li><a href="#">NitricX Pump</a></li>
+        </ul>
+      </div>
+      <div>
+        <span class="footer-col-title">Company</span>
+        <ul class="footer-links">
+          <li><a href="#">About Us</a></li>
+          <li><a href="#">Flavors</a></li>
+          <li><a href="#">How It Works</a></li>
+          <li><a href="#">Contact</a></li>
+        </ul>
+      </div>
+      <div>
+        <span class="footer-col-title">Support</span>
+        <ul class="footer-links">
+          <li><a href="#">FAQ</a></li>
+          <li><a href="#">Shipping</a></li>
+          <li><a href="#">Returns</a></li>
+          <li><a href="#">Store Locator</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p class="footer-copy">© 2026 NitricX. All rights reserved. S7 Formula™</p>
+      <div class="footer-socials">
+        <a href="#">IG</a>
+        <a href="#">TT</a>
+        <a href="#">YT</a>
+        <a href="#">X</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<!-- ═══════ GOOGLE DRIVE EXPORT FAB ═══════ -->
+<button class="gdrive-fab" onclick="openExportModal()" aria-label="Export to Google Drive">
+  <svg viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg">
+    <path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"></path>
+    <path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44a9.06 9.06 0 0 0 -1.2 4.5h27.5z" fill="#00ac47"></path>
+    <path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"></path>
+    <path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"></path>
+    <path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"></path>
+    <path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 27h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"></path>
+  </svg>
+  Export to Drive
+</button>
+
+<!-- ═══════ GOOGLE DRIVE EXPORT MODAL ═══════ -->
+<div class="gdrive-modal-overlay open" id="gdriveModal" onclick="handleOverlayClick(event)">
+  <div class="gdrive-modal">
+    <div class="gm-header">
+      <div class="gm-title-row">
+        <svg width="28" height="28" viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg">
+          <path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"></path>
+          <path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44a9.06 9.06 0 0 0 -1.2 4.5h27.5z" fill="#00ac47"></path>
+          <path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"></path>
+          <path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"></path>
+          <path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"></path>
+          <path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 27h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"></path>
+        </svg>
+        <div>
+          <div class="gm-title">Export to Drive</div>
+          <div class="gm-subtitle">Save all site files to Google Drive</div>
+        </div>
+      </div>
+      <button class="gm-close" onclick="closeExportModal()">✕</button>
+    </div>
+    <div class="gm-body">
+      <p class="gm-desc">This will download all NITRICX website files as a ZIP package and open Google Drive so you can upload them. All pages, styles, and the product image are included.</p>
+
+      <ul class="gm-files" id="gm-file-list">
+        <li class="gm-file">
+          <span class="gm-file-icon">🌐</span>
+          <span class="gm-file-name">apex-drink.html</span>
+          <span class="gm-file-size">~85 KB</span>
+          <span class="gm-file-status uploading" id="status-main">Fetching…</span>
+        </li>
+        <li class="gm-file">
+          <span class="gm-file-icon">🌐</span>
+          <span class="gm-file-name">products.html</span>
+          <span class="gm-file-size">~42 KB</span>
+          <span class="gm-file-status waiting" id="status-products">Waiting</span>
+        </li>
+        <li class="gm-file">
+          <span class="gm-file-icon">🌐</span>
+          <span class="gm-file-name">nitricx-original.html</span>
+          <span class="gm-file-size">~38 KB</span>
+          <span class="gm-file-status waiting" id="status-orig">Waiting</span>
+        </li>
+        <li class="gm-file">
+          <span class="gm-file-icon">🌐</span>
+          <span class="gm-file-name">nitricx-black.html</span>
+          <span class="gm-file-size">~34 KB</span>
+          <span class="gm-file-status waiting" id="status-black">Waiting</span>
+        </li>
+        <li class="gm-file">
+          <span class="gm-file-icon">🌐</span>
+          <span class="gm-file-name">nitricx-purple.html</span>
+          <span class="gm-file-size">~36 KB</span>
+          <span class="gm-file-status waiting" id="status-purple">Waiting</span>
+        </li>
+        <li class="gm-file">
+          <span class="gm-file-icon">🌐</span>
+          <span class="gm-file-name">nitricx-pump.html</span>
+          <span class="gm-file-size">~34 KB</span>
+          <span class="gm-file-status waiting" id="status-pump">Waiting</span>
+        </li>
+        <li class="gm-file">
+          <span class="gm-file-icon">🖼️</span>
+          <span class="gm-file-name">Skinny_transparent.png</span>
+          <span class="gm-file-size">~1.2 MB</span>
+          <span class="gm-file-status waiting" id="status-img">Waiting</span>
+        </li>
+      </ul>
+
+      <div class="gm-progress-bar-wrap" id="gm-progress-wrap" style="display: block;">
+        <div class="gm-progress-bar" id="gm-progress-bar" style="width: 0%;"></div>
+      </div>
+
+      <div class="gm-actions">
+        <button class="gm-btn-primary" id="gm-export-btn" onclick="startExport()" disabled=""><span style="animation:pulse-txt 1s ease-in-out infinite;display:inline-block">Packaging…</span></button>
+        <button class="gm-btn-secondary" onclick="openDriveOnly()">Open Drive Only</button>
+      </div>
+
+      <p class="gm-status-msg" id="gm-status">Packaging apex-drink.html…</p>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── CURSOR (disabled — using default cursor) ──
+
+// ── SCROLL REVEAL ──
+const obs = new IntersectionObserver(entries => {
+  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('up'); });
+}, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+document.querySelectorAll('.reveal, .reveal-left, .reveal-right').forEach(el => obs.observe(el));
+
+// ── COUNTER ANIMATION ──
+const counters = document.querySelectorAll('.mgrid-num, .pbn-num, .hstat-num');
+const cObs = new IntersectionObserver(entries => {
+  entries.forEach(entry => {
+    if (!entry.isIntersecting || entry.target.dataset.done) return;
+    entry.target.dataset.done = '1';
+    const orig = entry.target.textContent.trim();
+    const num  = parseFloat(orig.replace(/[^0-9.]/g,''));
+    if (isNaN(num) || num === 0) return;
+    const suffix = orig.replace(/[0-9.]/g,'');
+    let c = 0; const steps = 50; const inc = num / steps;
+    const t = setInterval(() => {
+      c = Math.min(c + inc, num);
+      const disp = Number.isInteger(num) ? Math.floor(c) : c.toFixed(1);
+      entry.target.textContent = disp + suffix;
+      if (c >= num) clearInterval(t);
+    }, 25);
+  });
+}, { threshold: 0.5 });
+counters.forEach(el => cObs.observe(el));
+
+// ── ACTIVE NAV ──
+const sections = document.querySelectorAll('section[id]');
+const navLinks = document.querySelectorAll('.nav-center a');
+window.addEventListener('scroll', () => {
+  let cur = '';
+  sections.forEach(s => { if (window.scrollY >= s.offsetTop - 100) cur = s.id; });
+  navLinks.forEach(a => {
+    a.style.color = a.getAttribute('href') === '#' + cur ? 'var(--yellow)' : '';
+  });
+});
+
+// ══════════════════════════════════════
+//  GOOGLE DRIVE EXPORT
+// ══════════════════════════════════════
+function openExportModal() {
+  document.getElementById('gdriveModal').classList.add('open');
+  document.body.style.overflow = 'hidden';
+  resetExportState();
+}
+function closeExportModal() {
+  document.getElementById('gdriveModal').classList.remove('open');
+  document.body.style.overflow = '';
+}
+function handleOverlayClick(e) {
+  if (e.target === document.getElementById('gdriveModal')) closeExportModal();
+}
+function openDriveOnly() {
+  window.open('https://drive.google.com/drive/my-drive', '_blank');
+  setStatus('Google Drive opened in a new tab. Upload your ZIP file there.', '');
+}
+
+function resetExportState() {
+  ['main','products','orig','black','purple','pump','img'].forEach(id => {
+    const el = document.getElementById('status-' + id);
+    if (el) { el.textContent = 'Waiting'; el.className = 'gm-file-status waiting'; }
+  });
+  document.getElementById('gm-progress-wrap').style.display = 'none';
+  document.getElementById('gm-progress-bar').style.width = '0%';
+  document.getElementById('gm-export-btn').disabled = false;
+  document.getElementById('gm-export-btn').innerHTML = `
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+    </svg>
+    Download ZIP + Open Drive`;
+  setStatus('', '');
+}
+
+function setStatus(msg, type) {
+  const el = document.getElementById('gm-status');
+  el.textContent = msg;
+  el.className = 'gm-status-msg' + (type ? ' ' + type : '');
+}
+
+function setFileStatus(id, text, type) {
+  const el = document.getElementById('status-' + id);
+  if (el) { el.textContent = text; el.className = 'gm-file-status ' + type; }
+}
+
+async function startExport() {
+  const btn = document.getElementById('gm-export-btn');
+  btn.disabled = true;
+  btn.innerHTML = `<span style="animation:pulse-txt 1s ease-in-out infinite;display:inline-block">Packaging…</span>`;
+
+  const progressWrap = document.getElementById('gm-progress-wrap');
+  const progressBar  = document.getElementById('gm-progress-bar');
+  progressWrap.style.display = 'block';
+
+  setStatus('Collecting files…', '');
+
+  const fileIds = ['main','products','orig','black','purple','pump','img'];
+  const fileNames = [
+    'apex-drink.html','products.html','nitricx-original.html',
+    'nitricx-black.html','nitricx-purple.html','nitricx-pump.html',
+    'Skinny_transparent.png'
+  ];
+
+  // ── Build a ZIP using JSZip (CDN) ──
+  // Dynamically load JSZip
+  if (!window.JSZip) {
+    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+  }
+
+  const zip = new JSZip();
+  const folder = zip.folder('NITRICX-Website');
+
+  let done = 0;
+  const total = fileNames.length;
+
+  for (let i = 0; i < fileNames.length; i++) {
+    const id   = fileIds[i];
+    const name = fileNames[i];
+    setFileStatus(id, 'Fetching…', 'uploading');
+    setStatus(`Packaging ${name}…`, '');
+
+    try {
+      const response = await fetch(name);
+      if (!response.ok) throw new Error('Not found');
+      const blob = await response.blob();
+      folder.file(name, blob);
+      setFileStatus(id, '✓ Ready', 'done');
+    } catch (e) {
+      // If fetch fails (cross-origin in preview), package the current page HTML
+      if (name === 'apex-drink.html') {
+        const html = '<!DOCTYPE html>' + document.documentElement.outerHTML;
+        folder.file(name, html, { type: 'text/html' });
+        setFileStatus(id, '✓ Ready', 'done');
+      } else {
+        setFileStatus(id, 'Skipped', 'waiting');
+      }
+    }
+
+    done++;
+    progressBar.style.width = Math.round((done / total) * 80) + '%';
+    await new Promise(r => setTimeout(r, 120));
+  }
+
+  // Add a README
+  folder.file('README.txt',
+    'NITRICX Website Files\n' +
+    '══════════════════════\n\n' +
+    'Files included:\n' +
+    '  • apex-drink.html      — Main homepage\n' +
+    '  • products.html        — Products page\n' +
+    '  • nitricx-original.html\n' +
+    '  • nitricx-black.html\n' +
+    '  • nitricx-purple.html\n' +
+    '  • nitricx-pump.html\n' +
+    '  • Skinny_transparent.png — Product can image\n\n' +
+    'To use: Keep all files in the same folder.\n' +
+    'Open apex-drink.html in a browser to view the site.\n\n' +
+    'To host: Upload all files to any web hosting provider.\n' +
+    '© 2026 NitricX. S7 Formula™'
+  );
+
+  setStatus('Generating ZIP…', '');
+  progressBar.style.width = '90%';
+
+  try {
+    const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    progressBar.style.width = '100%';
+
+    // Trigger download
+    const url  = URL.createObjectURL(zipBlob);
+    const link = document.createElement('a');
+    link.href     = url;
+    link.download = 'NITRICX-Website.zip';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+    // Open Google Drive
+    setTimeout(() => {
+      window.open('https://drive.google.com/drive/my-drive', '_blank');
+    }, 800);
+
+    btn.innerHTML = '✓ Downloaded!';
+    btn.style.background = '#4CAF50';
+    setStatus('✓ ZIP downloaded. Google Drive opened — drag the ZIP in to upload.', 'success');
+
+  } catch (err) {
+    btn.disabled = false;
+    btn.innerHTML = 'Try Again';
+    setStatus('⚠ Error generating ZIP. Try "Open Drive Only" to upload manually.', 'error');
+  }
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+</script>
+
+
+
+</body></html>
